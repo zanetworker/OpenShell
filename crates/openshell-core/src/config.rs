@@ -15,6 +15,7 @@ use std::str::FromStr;
 pub enum ComputeDriverKind {
     Kubernetes,
     Vm,
+    Docker,
     Podman,
 }
 
@@ -24,6 +25,7 @@ impl ComputeDriverKind {
         match self {
             Self::Kubernetes => "kubernetes",
             Self::Vm => "vm",
+            Self::Docker => "docker",
             Self::Podman => "podman",
         }
     }
@@ -42,9 +44,10 @@ impl FromStr for ComputeDriverKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "kubernetes" => Ok(Self::Kubernetes),
             "vm" => Ok(Self::Vm),
+            "docker" => Ok(Self::Docker),
             "podman" => Ok(Self::Podman),
             other => Err(format!(
-                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, podman"
+                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman"
             )),
         }
     }
@@ -370,12 +373,16 @@ mod tests {
             "podman".parse::<ComputeDriverKind>().unwrap(),
             ComputeDriverKind::Podman
         );
+        assert_eq!(
+            "docker".parse::<ComputeDriverKind>().unwrap(),
+            ComputeDriverKind::Docker
+        );
     }
 
     #[test]
     fn compute_driver_kind_rejects_unknown_values() {
-        let err = "docker".parse::<ComputeDriverKind>().unwrap_err();
-        assert!(err.contains("unsupported compute driver 'docker'"));
+        let err = "firecracker".parse::<ComputeDriverKind>().unwrap_err();
+        assert!(err.contains("unsupported compute driver 'firecracker'"));
     }
 
     #[test]

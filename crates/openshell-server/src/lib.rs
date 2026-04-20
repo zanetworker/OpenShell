@@ -43,7 +43,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};
 
-use compute::{ComputeRuntime, VmComputeConfig};
+use compute::{ComputeRuntime, DockerComputeConfig, VmComputeConfig};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
@@ -134,6 +134,7 @@ impl ServerState {
 pub async fn run_server(
     config: Config,
     vm_config: VmComputeConfig,
+    docker_config: DockerComputeConfig,
     tracing_log_bus: TracingLogBus,
 ) -> Result<()> {
     let database_url = config.database_url.trim();
@@ -153,6 +154,7 @@ pub async fn run_server(
     let compute = build_compute_runtime(
         &config,
         &vm_config,
+        &docker_config,
         store.clone(),
         sandbox_index.clone(),
         sandbox_watch_bus.clone(),
@@ -238,6 +240,7 @@ pub async fn run_server(
 async fn build_compute_runtime(
     config: &Config,
     vm_config: &VmComputeConfig,
+    docker_config: &DockerComputeConfig,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
@@ -272,6 +275,16 @@ async fn build_compute_runtime(
         )
         .await
         .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
+        ComputeDriverKind::Docker => ComputeRuntime::new_docker(
+            config.clone(),
+            docker_config.clone(),
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+        )
+        .await
+        .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
         ComputeDriverKind::Vm => {
             let (channel, driver_process) = compute::vm::spawn(config, vm_config).await?;
             ComputeRuntime::new_remote_vm(
@@ -296,7 +309,9 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
         [] => Err(Error::config(
             "at least one compute driver must be configured",
         )),
-        [driver @ ComputeDriverKind::Kubernetes] | [driver @ ComputeDriverKind::Vm] => Ok(*driver),
+        [driver @ ComputeDriverKind::Kubernetes]
+        | [driver @ ComputeDriverKind::Vm]
+        | [driver @ ComputeDriverKind::Docker] => Ok(*driver),
         [ComputeDriverKind::Podman] => Err(Error::config(
             "compute driver 'podman' is not implemented yet",
         )),
@@ -380,6 +395,15 @@ mod tests {
         assert_eq!(
             configured_compute_driver(&config).unwrap(),
             ComputeDriverKind::Vm
+        );
+    }
+
+    #[test]
+    fn configured_compute_driver_accepts_docker() {
+        let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Docker]);
+        assert_eq!(
+            configured_compute_driver(&config).unwrap(),
+            ComputeDriverKind::Docker
         );
     }
 }
