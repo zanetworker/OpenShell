@@ -1,0 +1,22 @@
+# Simple supervisor-only build for linux/amd64.
+# Skips the complex cross-build machinery from the main Dockerfile.
+FROM rust:1.88-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake g++ make protobuf-compiler pkg-config && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY proto/ proto/
+
+RUN cargo build --release -p openshell-sandbox 2>&1 && \
+    cp target/release/openshell-sandbox /openshell-sandbox
+
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+RUN useradd --create-home --user-group openshell
+COPY --from=builder /openshell-sandbox /usr/local/bin/openshell-sandbox
+USER openshell
+ENTRYPOINT ["openshell-sandbox"]

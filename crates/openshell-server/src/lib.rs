@@ -284,7 +284,29 @@ async fn build_compute_runtime(
                 )
             })?;
             info!(socket = %socket_path.display(), "Connecting to external compute driver");
-            let channel = compute::vm::connect_compute_driver(socket_path).await?;
+            // Retry loop: the external driver may not have its socket ready yet
+            // when the gateway starts (e.g. sidecar containers start concurrently).
+            let mut channel = None;
+            let mut last_err = String::new();
+            for attempt in 0..100 {
+                match compute::vm::connect_compute_driver(socket_path).await {
+                    Ok(ch) => {
+                        info!(attempts = attempt + 1, "Connected to external compute driver");
+                        channel = Some(ch);
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = format!("{e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            }
+            let channel = channel.ok_or_else(|| {
+                Error::execution(format!(
+                    "failed to connect to external compute driver at '{}' after 100 attempts: {last_err}",
+                    socket_path.display()
+                ))
+            })?;
             ComputeRuntime::new_remote_vm(
                 channel,
                 None, // no child process to manage
