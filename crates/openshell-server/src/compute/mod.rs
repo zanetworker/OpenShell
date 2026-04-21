@@ -189,6 +189,23 @@ pub struct ComputeRuntime {
     sandbox_watch_bus: SandboxWatchBus,
     tracing_log_bus: TracingLogBus,
     sync_lock: Arc<Mutex<()>>,
+    /// Optional weak handle to the supervisor session registry, installed
+    /// via [`Self::install_supervisor_observer`] during server startup.
+    /// Used by [`Self::apply_sandbox_update_locked`] to backfill Ready when
+    /// the supervisor session registered before the driver snapshot arrived.
+    ///
+    /// Held as [`std::sync::Weak`] to break the cycle between the
+    /// registry (owned by `ServerState` via `Arc`) and the observer it
+    /// installs (which owns a cloned [`ComputeRuntime`]). Without
+    /// `Weak` here, dropping `ServerState` would not free either side.
+    /// Stored inside a [`std::sync::Mutex`] because the access pattern
+    /// is a single write during startup and cheap reads after;
+    /// `tokio::sync::Mutex` would force awaits in otherwise-sync paths.
+    supervisor_sessions: Arc<
+        std::sync::Mutex<
+            Option<std::sync::Weak<crate::supervisor_session::SupervisorSessionRegistry>>,
+        >,
+    >,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -221,7 +238,42 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             sync_lock: Arc::new(Mutex::new(())),
+            supervisor_sessions: Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    /// Bind the runtime to the server's supervisor session registry. Called
+    /// once during server startup, after both objects exist. Enables:
+    ///
+    /// 1. The registry's `SupervisorSessionObserver` implementation below to
+    ///    fire [`Self::mark_sandbox_session_connected`] /
+    ///    [`Self::mark_sandbox_session_disconnected`] on session lifecycle
+    ///    events.
+    /// 2. [`Self::apply_sandbox_update_locked`] to consult
+    ///    [`crate::supervisor_session::SupervisorSessionRegistry::has_session`]
+    ///    and backfill Ready when the supervisor already connected before
+    ///    the driver reported the sandbox.
+    pub fn install_supervisor_observer(
+        &self,
+        registry: &Arc<crate::supervisor_session::SupervisorSessionRegistry>,
+    ) {
+        *self.supervisor_sessions.lock().unwrap() = Some(Arc::downgrade(registry));
+        registry.set_observer(Arc::new(ComputeSessionObserver {
+            compute: self.clone(),
+        }));
+    }
+
+    /// Cheap snapshot of the supervisor registry handle. Returns `None`
+    /// when [`Self::install_supervisor_observer`] was never called, or
+    /// when the underlying registry has been dropped (test teardown).
+    fn supervisor_registry(
+        &self,
+    ) -> Option<Arc<crate::supervisor_session::SupervisorSessionRegistry>> {
+        self.supervisor_sessions
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
     }
 
     pub async fn new_kubernetes(
@@ -609,10 +661,146 @@ impl ComputeRuntime {
         sandbox.status = status;
         sandbox.phase = phase as i32;
 
+        // Backfill: if the supervisor session registered before the driver
+        // reported this sandbox, the registry's own callback flips to
+        // Ready only if the store already holds the record (it didn't
+        // back then). This path catches that race by re-checking on every
+        // driver snapshot. Only promotes from non-terminal, non-Ready
+        // phases so we never mask a driver-reported failure.
+        if let Some(registry) = self.supervisor_registry()
+            && registry.has_session(&sandbox.id)
+        {
+            let current = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+            if matches!(current, SandboxPhase::Provisioning | SandboxPhase::Unknown) {
+                promote_ready_on_supervisor_session(&mut sandbox);
+                info!(
+                    sandbox_id = %sandbox.id,
+                    sandbox_name = %sandbox.name,
+                    old_phase = ?current,
+                    new_phase = ?SandboxPhase::Ready,
+                    "Sandbox phase changed (backfill via live supervisor session)"
+                );
+            }
+        }
+
         if previous.as_ref() == Some(&sandbox) {
             return Ok(());
         }
 
+        self.sandbox_index.update_from_sandbox(&sandbox);
+        self.store
+            .put_message(&sandbox)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.sandbox_watch_bus.notify(&sandbox.id);
+        Ok(())
+    }
+
+    /// Promote a sandbox's phase to [`SandboxPhase::Ready`] now that its
+    /// supervisor session has been established with the gateway.
+    ///
+    /// This is called from [`crate::supervisor_session::SupervisorSessionRegistry`]
+    /// when a `ConnectSupervisor` RPC succeeds. A live supervisor session is
+    /// the authoritative "sandbox is usable" signal: it proves the sandbox
+    /// has outbound connectivity to the gateway, that mTLS identity matched,
+    /// and that the relay plane is ready to service SSH/exec. Compute
+    /// drivers (Kubernetes, VM) no longer need to scrape their own liveness.
+    ///
+    /// No-ops when:
+    /// * the sandbox is not in the store (the session registered before the
+    ///   driver snapshot landed — the follow-up driver update backfills
+    ///   readiness via the `has_session` check in
+    ///   `apply_sandbox_update_locked`);
+    /// * the sandbox phase is already `Ready` — a reconnect / supersede
+    ///   shouldn't churn the record;
+    /// * the sandbox phase is `Deleting` or `Error` — those states are
+    ///   terminal relative to the compute driver and must not be masked by
+    ///   a late-arriving supervisor signal.
+    pub async fn mark_sandbox_session_connected(&self, sandbox_id: &str) {
+        let _guard = self.sync_lock.lock().await;
+        if let Err(err) = self.mark_sandbox_session_connected_locked(sandbox_id).await {
+            warn!(%sandbox_id, error = %err, "failed to promote sandbox to Ready on supervisor session");
+        }
+    }
+
+    async fn mark_sandbox_session_connected_locked(&self, sandbox_id: &str) -> Result<(), String> {
+        let Some(record) = self
+            .store
+            .get(Sandbox::object_type(), sandbox_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            // Session registered before the driver reported the sandbox.
+            // The next driver snapshot will call back through
+            // `apply_sandbox_update_locked`, which consults
+            // `has_session` and promotes on the spot.
+            return Ok(());
+        };
+
+        let mut sandbox = decode_sandbox_record(&record)?;
+        let current = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+        match current {
+            SandboxPhase::Ready | SandboxPhase::Deleting | SandboxPhase::Error => {
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        promote_ready_on_supervisor_session(&mut sandbox);
+        info!(
+            %sandbox_id,
+            old_phase = ?current,
+            new_phase = ?SandboxPhase::Ready,
+            "Sandbox phase changed"
+        );
+        self.sandbox_index.update_from_sandbox(&sandbox);
+        self.store
+            .put_message(&sandbox)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.sandbox_watch_bus.notify(&sandbox.id);
+        Ok(())
+    }
+
+    /// Demote a sandbox from `Ready` back to `Provisioning` when its
+    /// supervisor session ends. No-op if the sandbox isn't Ready (already
+    /// Provisioning, Deleting, or Error).
+    pub async fn mark_sandbox_session_disconnected(&self, sandbox_id: &str) {
+        let _guard = self.sync_lock.lock().await;
+        if let Err(err) = self
+            .mark_sandbox_session_disconnected_locked(sandbox_id)
+            .await
+        {
+            warn!(%sandbox_id, error = %err, "failed to demote sandbox on supervisor session end");
+        }
+    }
+
+    async fn mark_sandbox_session_disconnected_locked(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<(), String> {
+        let Some(record) = self
+            .store
+            .get(Sandbox::object_type(), sandbox_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(());
+        };
+
+        let mut sandbox = decode_sandbox_record(&record)?;
+        let current = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+        if current != SandboxPhase::Ready {
+            return Ok(());
+        }
+
+        demote_ready_on_supervisor_session(&mut sandbox);
+        info!(
+            %sandbox_id,
+            old_phase = ?current,
+            new_phase = ?SandboxPhase::Provisioning,
+            "Sandbox phase changed"
+        );
         self.sandbox_index.update_from_sandbox(&sandbox);
         self.store
             .put_message(&sandbox)
@@ -1035,6 +1223,91 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
     !transient_reasons.contains(&reason.as_str())
 }
 
+/// Reason string written onto the Ready condition when a supervisor session
+/// is the trigger for the transition. Kept short and grep-able — the CLI
+/// surfaces condition reasons in the sandbox provisioning spinner on
+/// timeout. Matches the other reason labels (`Starting`, `Unschedulable`).
+pub(crate) const SUPERVISOR_CONNECTED_REASON: &str = "SupervisorConnected";
+pub(crate) const SUPERVISOR_DISCONNECTED_REASON: &str = "SupervisorDisconnected";
+
+/// Bridge between [`crate::supervisor_session::SupervisorSessionRegistry`]
+/// and [`ComputeRuntime`]. Holds a cloned [`ComputeRuntime`] rather than
+/// an [`Arc`]-weak because `ComputeRuntime` is already cheap-to-clone
+/// (every non-scalar field is already `Arc`-wrapped internally).
+///
+/// The cycle with the registry is broken on the runtime side: its own
+/// `supervisor_sessions` handle is a [`std::sync::Weak`].
+struct ComputeSessionObserver {
+    compute: ComputeRuntime,
+}
+
+impl crate::supervisor_session::SupervisorSessionObserver for ComputeSessionObserver {
+    fn on_session_connected(&self, sandbox_id: String) {
+        let compute = self.compute.clone();
+        tokio::spawn(async move {
+            compute.mark_sandbox_session_connected(&sandbox_id).await;
+        });
+    }
+
+    fn on_session_disconnected(&self, sandbox_id: String) {
+        let compute = self.compute.clone();
+        tokio::spawn(async move {
+            compute.mark_sandbox_session_disconnected(&sandbox_id).await;
+        });
+    }
+}
+
+/// Flip `sandbox.phase` to `Ready` and update its `Ready` condition to
+/// reflect a live supervisor session. Preserves all non-`Ready` conditions
+/// the driver may have already reported (e.g. `VmRunning`).
+fn promote_ready_on_supervisor_session(sandbox: &mut Sandbox) {
+    sandbox.phase = SandboxPhase::Ready as i32;
+    let status = sandbox.status.get_or_insert_with(SandboxStatus::default);
+    upsert_ready_condition(
+        status,
+        "True",
+        SUPERVISOR_CONNECTED_REASON,
+        "Supervisor session established; relay plane is ready",
+    );
+}
+
+/// Flip `sandbox.phase` back to `Provisioning` after the supervisor session
+/// ends. Signals the CLI / TUI that the sandbox is no longer reachable
+/// without killing the underlying driver resource, which may recover on a
+/// supervisor reconnect.
+fn demote_ready_on_supervisor_session(sandbox: &mut Sandbox) {
+    sandbox.phase = SandboxPhase::Provisioning as i32;
+    let status = sandbox.status.get_or_insert_with(SandboxStatus::default);
+    upsert_ready_condition(
+        status,
+        "False",
+        SUPERVISOR_DISCONNECTED_REASON,
+        "Supervisor session ended; waiting for the sandbox to reconnect",
+    );
+}
+
+fn upsert_ready_condition(
+    status: &mut SandboxStatus,
+    ready_status: &str,
+    reason: &str,
+    message: &str,
+) {
+    if let Some(existing) = status.conditions.iter_mut().find(|c| c.r#type == "Ready") {
+        existing.status = ready_status.to_string();
+        existing.reason = reason.to_string();
+        existing.message = message.to_string();
+        existing.last_transition_time = String::new();
+    } else {
+        status.conditions.push(SandboxCondition {
+            r#type: "Ready".to_string(),
+            status: ready_status.to_string(),
+            reason: reason.to_string(),
+            message: message.to_string(),
+            last_transition_time: String::new(),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1160,6 +1433,7 @@ mod tests {
             sandbox_watch_bus: SandboxWatchBus::new(),
             tracing_log_bus: TracingLogBus::new(),
             sync_lock: Arc::new(Mutex::new(())),
+            supervisor_sessions: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -1618,5 +1892,269 @@ mod tests {
             watch_rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Closed)
         ));
+    }
+
+    // ── Gateway-side readiness promotion via supervisor sessions ─────────
+
+    #[tokio::test]
+    async fn mark_session_connected_promotes_provisioning_to_ready() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.mark_sandbox_session_connected("sb-1").await;
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::Ready
+        );
+        let status = stored.status.expect("status should be set");
+        let ready = status
+            .conditions
+            .iter()
+            .find(|c| c.r#type == "Ready")
+            .expect("Ready condition should be present");
+        assert_eq!(ready.status, "True");
+        assert_eq!(ready.reason, SUPERVISOR_CONNECTED_REASON);
+    }
+
+    #[tokio::test]
+    async fn mark_session_connected_is_noop_when_absent() {
+        // Session-before-record race: the callback must not create rows.
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        runtime.mark_sandbox_session_connected("sb-missing").await;
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-missing")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_session_connected_is_noop_when_deleting() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Deleting);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.mark_sandbox_session_connected("sb-1").await;
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::Deleting
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_session_connected_is_noop_when_error() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Error);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.mark_sandbox_session_connected("sb-1").await;
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::Error
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_session_connected_is_idempotent_when_already_ready() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        // First call promotes; second must be a no-op without churning
+        // the record.
+        runtime.mark_sandbox_session_connected("sb-1").await;
+        runtime.mark_sandbox_session_connected("sb-1").await;
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::Ready
+        );
+        sandbox.phase = SandboxPhase::Ready as i32;
+        // Only one Ready condition — no duplicates accumulated.
+        let ready_count = stored
+            .status
+            .as_ref()
+            .unwrap()
+            .conditions
+            .iter()
+            .filter(|c| c.r#type == "Ready")
+            .count();
+        assert_eq!(ready_count, 1);
+    }
+
+    #[tokio::test]
+    async fn mark_session_disconnected_reverts_ready_to_provisioning() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.status = Some(SandboxStatus {
+            sandbox_name: "sandbox-a".to_string(),
+            agent_pod: "vm-1".to_string(),
+            agent_fd: String::new(),
+            sandbox_fd: String::new(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: SUPERVISOR_CONNECTED_REASON.to_string(),
+                message: "ok".to_string(),
+                last_transition_time: String::new(),
+            }],
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.mark_sandbox_session_disconnected("sb-1").await;
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::Provisioning
+        );
+        let ready = stored
+            .status
+            .unwrap()
+            .conditions
+            .into_iter()
+            .find(|c| c.r#type == "Ready")
+            .expect("Ready condition should remain");
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, SUPERVISOR_DISCONNECTED_REASON);
+    }
+
+    #[tokio::test]
+    async fn mark_session_disconnected_is_noop_when_not_ready() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.mark_sandbox_session_disconnected("sb-1").await;
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::Provisioning
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_update_backfills_ready_when_session_already_live() {
+        // Covers the register-before-store race: the supervisor's
+        // ConnectSupervisor landed before the driver reported the
+        // sandbox, so the initial callback found no row. The next
+        // driver snapshot must check the registry and promote on the
+        // spot.
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let registry = Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new());
+        *runtime.supervisor_sessions.lock().unwrap() = Some(Arc::downgrade(&registry));
+
+        // Simulate a live session without a persisted sandbox.
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+        registry.register("sb-1".to_string(), "session-1".to_string(), tx, shutdown_tx);
+
+        // Driver now reports the sandbox as transient / provisioning.
+        let driver_sandbox = DriverSandbox {
+            id: "sb-1".to_string(),
+            name: "sandbox-a".to_string(),
+            namespace: "default".to_string(),
+            status: Some(make_driver_status(make_driver_condition(
+                "Starting",
+                "VM is starting",
+            ))),
+            ..Default::default()
+        };
+
+        runtime.apply_sandbox_update(driver_sandbox).await.unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::Ready
+        );
+        let ready = stored
+            .status
+            .unwrap()
+            .conditions
+            .into_iter()
+            .find(|c| c.r#type == "Ready")
+            .expect("Ready condition should be set");
+        assert_eq!(ready.reason, SUPERVISOR_CONNECTED_REASON);
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_update_does_not_backfill_when_no_session() {
+        // Mirror of the test above, but without a live session: phase
+        // must follow the driver's reported condition.
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let registry = Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new());
+        *runtime.supervisor_sessions.lock().unwrap() = Some(Arc::downgrade(&registry));
+
+        let driver_sandbox = DriverSandbox {
+            id: "sb-1".to_string(),
+            name: "sandbox-a".to_string(),
+            namespace: "default".to_string(),
+            status: Some(make_driver_status(make_driver_condition(
+                "Starting",
+                "VM is starting",
+            ))),
+            ..Default::default()
+        };
+
+        runtime.apply_sandbox_update(driver_sandbox).await.unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::Provisioning
+        );
     }
 }

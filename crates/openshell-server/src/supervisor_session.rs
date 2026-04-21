@@ -61,6 +61,29 @@ struct LiveSession {
 /// Holds a oneshot sender that will deliver the upgraded relay stream.
 type RelayStreamSender = oneshot::Sender<tokio::io::DuplexStream>;
 
+/// Observer invoked when supervisor sessions register or unregister.
+///
+/// Implemented by [`crate::compute::ComputeRuntime`] so the gateway can
+/// promote a sandbox's phase to `Ready` the moment its supervisor establishes
+/// a `ConnectSupervisor` session, and demote it back to `Provisioning`
+/// when the session drops. This avoids having each compute driver scrape
+/// its own liveness signal (log tailing, TCP probes, etc.).
+///
+/// Callbacks are invoked off the registry's internal mutex and may perform
+/// async I/O (persistence writes, watch-bus notifications). They run on
+/// spawned tokio tasks, so a slow or failing observer cannot block the
+/// inbound `ConnectSupervisor` stream.
+pub trait SupervisorSessionObserver: Send + Sync + 'static {
+    /// The supervisor session for `sandbox_id` is live and accepting relays.
+    fn on_session_connected(&self, sandbox_id: String);
+
+    /// The supervisor session for `sandbox_id` has ended. Only fires when
+    /// the registration being removed matches the session currently live
+    /// for that sandbox (the supersede race is already resolved in
+    /// `remove_if_current`).
+    fn on_session_disconnected(&self, sandbox_id: String);
+}
+
 /// Registry of active supervisor sessions and pending relay channels.
 #[derive(Default)]
 pub struct SupervisorSessionRegistry {
@@ -68,6 +91,9 @@ pub struct SupervisorSessionRegistry {
     sessions: Mutex<HashMap<String, LiveSession>>,
     /// channel_id -> oneshot sender for the reverse CONNECT stream.
     pending_relays: Mutex<HashMap<String, PendingRelay>>,
+    /// Optional observer notified on session register / remove. Set once
+    /// during server wiring via [`Self::set_observer`].
+    observer: Mutex<Option<Arc<dyn SupervisorSessionObserver>>>,
 }
 
 struct PendingRelay {
@@ -92,6 +118,25 @@ impl SupervisorSessionRegistry {
         Self::default()
     }
 
+    /// Install the observer notified on session lifecycle events. Called
+    /// once during server wiring.
+    pub fn set_observer(&self, observer: Arc<dyn SupervisorSessionObserver>) {
+        *self.observer.lock().unwrap() = Some(observer);
+    }
+
+    /// Snapshot the observer handle (cheap `Arc` clone) for invocation
+    /// outside the `sessions` lock.
+    fn observer(&self) -> Option<Arc<dyn SupervisorSessionObserver>> {
+        self.observer.lock().unwrap().clone()
+    }
+
+    /// Returns `true` if a supervisor session is currently registered for
+    /// the given sandbox. Used by `compute` to back-fill readiness when a
+    /// driver snapshot arrives after the session has already registered.
+    pub fn has_session(&self, sandbox_id: &str) -> bool {
+        self.sessions.lock().unwrap().contains_key(sandbox_id)
+    }
+
     /// Register a live supervisor session for the given sandbox.
     ///
     /// If a previous session exists for the same sandbox, its shutdown signal
@@ -104,31 +149,46 @@ impl SupervisorSessionRegistry {
         tx: mpsc::Sender<GatewayMessage>,
         shutdown: oneshot::Sender<()>,
     ) -> bool {
-        let mut sessions = self.sessions.lock().unwrap();
-        let previous = sessions.remove(&sandbox_id);
-        sessions.insert(
-            sandbox_id.clone(),
-            LiveSession {
-                sandbox_id,
-                session_id,
-                tx,
-                shutdown,
-                connected_at: Instant::now(),
-            },
-        );
-        match previous {
-            Some(prev) => {
-                // Best-effort — the old task may have already exited.
-                let _ = prev.shutdown.send(());
-                true
+        let observer = self.observer();
+        let superseded = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let previous = sessions.remove(&sandbox_id);
+            sessions.insert(
+                sandbox_id.clone(),
+                LiveSession {
+                    sandbox_id: sandbox_id.clone(),
+                    session_id,
+                    tx,
+                    shutdown,
+                    connected_at: Instant::now(),
+                },
+            );
+            match previous {
+                Some(prev) => {
+                    // Best-effort — the old task may have already exited.
+                    let _ = prev.shutdown.send(());
+                    true
+                }
+                None => false,
             }
-            None => false,
+        };
+        // Notify outside the lock. Even for a supersede the gateway-side
+        // phase stays Ready, but fire `on_session_connected` so observers
+        // that care about the reconnect moment (e.g. logging) get a signal.
+        if let Some(obs) = observer {
+            obs.on_session_connected(sandbox_id);
         }
+        superseded
     }
 
     /// Remove the session for a sandbox.
     fn remove(&self, sandbox_id: &str) {
-        self.sessions.lock().unwrap().remove(sandbox_id);
+        let removed = self.sessions.lock().unwrap().remove(sandbox_id).is_some();
+        if removed {
+            if let Some(obs) = self.observer() {
+                obs.on_session_disconnected(sandbox_id.to_string());
+            }
+        }
     }
 
     /// Remove the session only if its `session_id` matches the one we are
@@ -138,14 +198,22 @@ impl SupervisorSessionRegistry {
     /// finish long after a new session has taken its place. The old task's
     /// cleanup must not evict the new registration.
     fn remove_if_current(&self, sandbox_id: &str, session_id: &str) -> bool {
-        let mut sessions = self.sessions.lock().unwrap();
-        let is_current = sessions
-            .get(sandbox_id)
-            .is_some_and(|s| s.session_id == session_id);
-        if is_current {
-            sessions.remove(sandbox_id);
+        let removed = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let is_current = sessions
+                .get(sandbox_id)
+                .is_some_and(|s| s.session_id == session_id);
+            if is_current {
+                sessions.remove(sandbox_id);
+            }
+            is_current
+        };
+        if removed {
+            if let Some(obs) = self.observer() {
+                obs.on_session_disconnected(sandbox_id.to_string());
+            }
         }
-        is_current
+        removed
     }
 
     /// Look up the sender for a supervisor session, waiting up to `timeout`
@@ -1199,5 +1267,121 @@ mod tests {
                 .unwrap()
                 .contains_key("ch-fresh")
         );
+    }
+
+    // ── Observer callbacks ─────────────────────────────────────────────
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: Mutex<Vec<(String, String)>>,
+    }
+
+    impl RecordingObserver {
+        fn events(&self) -> Vec<(String, String)> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl SupervisorSessionObserver for RecordingObserver {
+        fn on_session_connected(&self, sandbox_id: String) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(("connected".to_string(), sandbox_id));
+        }
+
+        fn on_session_disconnected(&self, sandbox_id: String) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(("disconnected".to_string(), sandbox_id));
+        }
+    }
+
+    #[test]
+    fn observer_fires_on_register_and_remove_if_current() {
+        let registry = SupervisorSessionRegistry::new();
+        let observer = Arc::new(RecordingObserver::default());
+        let observer_trait: Arc<dyn SupervisorSessionObserver> = observer.clone();
+        registry.set_observer(observer_trait);
+
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        registry.register("sbx".to_string(), "s1".to_string(), tx, shutdown_tx);
+
+        assert!(registry.remove_if_current("sbx", "s1"));
+
+        assert_eq!(
+            observer.events(),
+            vec![
+                ("connected".to_string(), "sbx".to_string()),
+                ("disconnected".to_string(), "sbx".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn observer_does_not_fire_disconnect_on_stale_remove() {
+        // Supersede race: the old session's cleanup must not look like a
+        // disconnect if a newer session has taken its place.
+        let registry = SupervisorSessionRegistry::new();
+        let observer = Arc::new(RecordingObserver::default());
+        let observer_trait: Arc<dyn SupervisorSessionObserver> = observer.clone();
+        registry.set_observer(observer_trait);
+
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (sh1, _sh1_rx) = oneshot::channel();
+        registry.register("sbx".to_string(), "s-old".to_string(), tx1, sh1);
+
+        let (tx2, _rx2) = mpsc::channel(1);
+        let (sh2, _sh2_rx) = oneshot::channel();
+        registry.register("sbx".to_string(), "s-new".to_string(), tx2, sh2);
+
+        // Stale cleanup from the old session's task — no-op.
+        assert!(!registry.remove_if_current("sbx", "s-old"));
+
+        assert_eq!(
+            observer.events(),
+            vec![
+                ("connected".to_string(), "sbx".to_string()),
+                ("connected".to_string(), "sbx".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn observer_fires_once_on_supersede() {
+        // A reconnect should surface as a fresh `connected` event so
+        // observers that care about the reconnection moment see it.
+        let registry = SupervisorSessionRegistry::new();
+        let observer = Arc::new(RecordingObserver::default());
+        let observer_trait: Arc<dyn SupervisorSessionObserver> = observer.clone();
+        registry.set_observer(observer_trait);
+
+        let (tx1, _rx1) = mpsc::channel(1);
+        let (sh1, _sh1_rx) = oneshot::channel();
+        registry.register("sbx".to_string(), "s1".to_string(), tx1, sh1);
+
+        let (tx2, _rx2) = mpsc::channel(1);
+        let (sh2, _sh2_rx) = oneshot::channel();
+        registry.register("sbx".to_string(), "s2".to_string(), tx2, sh2);
+
+        let events = observer.events();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|(kind, _)| kind == "connected"));
+    }
+
+    #[test]
+    fn has_session_reports_current_registration() {
+        let registry = SupervisorSessionRegistry::new();
+        assert!(!registry.has_session("sbx"));
+
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown, _shutdown_rx) = oneshot::channel();
+        registry.register("sbx".to_string(), "s1".to_string(), tx, shutdown);
+
+        assert!(registry.has_session("sbx"));
+        registry.remove_if_current("sbx", "s1");
+        assert!(!registry.has_session("sbx"));
     }
 }

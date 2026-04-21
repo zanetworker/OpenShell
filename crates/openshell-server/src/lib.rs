@@ -88,7 +88,12 @@ pub struct ServerState {
     pub settings_mutex: tokio::sync::Mutex<()>,
 
     /// Registry of active supervisor sessions and pending relay channels.
-    pub supervisor_sessions: supervisor_session::SupervisorSessionRegistry,
+    ///
+    /// Held behind an [`Arc`] so observers (notably [`crate::compute::ComputeRuntime`])
+    /// can take an owned handle during server wiring and call
+    /// [`supervisor_session::SupervisorSessionRegistry::has_session`] from
+    /// watch-loop tasks that outlive any borrow of [`ServerState`].
+    pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -119,7 +124,7 @@ impl ServerState {
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
-            supervisor_sessions: supervisor_session::SupervisorSessionRegistry::new(),
+            supervisor_sessions: Arc::new(supervisor_session::SupervisorSessionRegistry::new()),
         }
     }
 }
@@ -167,6 +172,14 @@ pub async fn run_server(
         sandbox_watch_bus,
         tracing_log_bus,
     ));
+
+    // Wire the compute runtime to the supervisor session registry so the
+    // gateway promotes a sandbox to Ready the moment its ConnectSupervisor
+    // RPC lands, and demotes it back to Provisioning when the session
+    // ends. Compute drivers no longer own the Ready transition.
+    state
+        .compute
+        .install_supervisor_observer(&state.supervisor_sessions);
 
     state.compute.spawn_watchers();
     ssh_tunnel::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
