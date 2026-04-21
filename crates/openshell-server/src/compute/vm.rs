@@ -382,7 +382,7 @@ async fn wait_for_compute_driver(
 }
 
 #[cfg(unix)]
-async fn connect_compute_driver(socket_path: &std::path::Path) -> Result<Channel> {
+pub(crate) async fn connect_compute_driver(socket_path: &std::path::Path) -> Result<Channel> {
     let socket_path = socket_path.to_path_buf();
     let display_path = socket_path.clone();
     Endpoint::from_static("http://[::]:50051")

@@ -16,6 +16,7 @@ pub enum ComputeDriverKind {
     Kubernetes,
     Vm,
     Podman,
+    External,
 }
 
 impl ComputeDriverKind {
@@ -25,6 +26,7 @@ impl ComputeDriverKind {
             Self::Kubernetes => "kubernetes",
             Self::Vm => "vm",
             Self::Podman => "podman",
+            Self::External => "external",
         }
     }
 }
@@ -43,8 +45,9 @@ impl FromStr for ComputeDriverKind {
             "kubernetes" => Ok(Self::Kubernetes),
             "vm" => Ok(Self::Vm),
             "podman" => Ok(Self::Podman),
+            "external" => Ok(Self::External),
             other => Err(format!(
-                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, podman"
+                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, podman, external"
             )),
         }
     }
@@ -135,6 +138,14 @@ pub struct Config {
     /// allowing them to reach services running on the Docker host.
     #[serde(default)]
     pub host_gateway_ip: String,
+
+    /// Unix domain socket path for an external compute driver.
+    /// When set with `--drivers external`, the gateway connects to a
+    /// pre-existing socket instead of spawning its own driver subprocess.
+    /// This enables out-of-process drivers written in any language that
+    /// implements the `ComputeDriver` gRPC contract.
+    #[serde(default)]
+    pub compute_driver_socket: Option<PathBuf>,
 }
 
 /// TLS configuration.
@@ -185,6 +196,7 @@ impl Config {
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
+            compute_driver_socket: None,
         }
     }
 
@@ -307,6 +319,13 @@ impl Config {
     #[must_use]
     pub fn with_host_gateway_ip(mut self, ip: impl Into<String>) -> Self {
         self.host_gateway_ip = ip.into();
+        self
+    }
+
+    /// Set the Unix domain socket path for an external compute driver.
+    #[must_use]
+    pub fn with_compute_driver_socket(mut self, path: PathBuf) -> Self {
+        self.compute_driver_socket = Some(path);
         self
     }
 }

@@ -121,6 +121,13 @@ struct Args {
     )]
     vm_driver_state_dir: PathBuf,
 
+    /// Unix domain socket path for an external compute driver.
+    /// When set with `--drivers external`, the gateway connects to this
+    /// pre-existing socket instead of spawning its own driver subprocess.
+    /// Enables out-of-process drivers written in any language.
+    #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
+    compute_driver_socket: Option<PathBuf>,
+
     /// Directory searched for compute-driver binaries (e.g.
     /// `openshell-driver-vm`) when an explicit binary override isn't
     /// configured. When unset, the gateway searches
@@ -262,6 +269,10 @@ async fn run_from_args(args: Args) -> Result<()> {
 
     if let Some(ip) = args.host_gateway_ip {
         config = config.with_host_gateway_ip(ip);
+    }
+
+    if let Some(socket) = args.compute_driver_socket {
+        config = config.with_compute_driver_socket(socket);
     }
 
     let vm_config = VmComputeConfig {

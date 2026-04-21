@@ -277,6 +277,25 @@ async fn build_compute_runtime(
         ComputeDriverKind::Podman => Err(Error::config(
             "compute driver 'podman' is not implemented yet",
         )),
+        ComputeDriverKind::External => {
+            let socket_path = config.compute_driver_socket.as_ref().ok_or_else(|| {
+                Error::config(
+                    "compute driver 'external' requires --compute-driver-socket to be set",
+                )
+            })?;
+            info!(socket = %socket_path.display(), "Connecting to external compute driver");
+            let channel = compute::vm::connect_compute_driver(socket_path).await?;
+            ComputeRuntime::new_remote_vm(
+                channel,
+                None, // no child process to manage
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+            )
+            .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
+        }
     }
 }
 
@@ -285,7 +304,9 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
         [] => Err(Error::config(
             "at least one compute driver must be configured",
         )),
-        [driver @ ComputeDriverKind::Kubernetes] | [driver @ ComputeDriverKind::Vm] => Ok(*driver),
+        [driver @ ComputeDriverKind::Kubernetes]
+        | [driver @ ComputeDriverKind::Vm]
+        | [driver @ ComputeDriverKind::External] => Ok(*driver),
         [ComputeDriverKind::Podman] => Err(Error::config(
             "compute driver 'podman' is not implemented yet",
         )),
