@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
-use openshell_ocsf::format::downgrade::downgrade_event;
+use openshell_ocsf::format::downgrade::{DowngradeOutcome, downgrade_event, record_kept_native};
 use openshell_ocsf::{OCSF_TARGET, OcsfEvent, OcsfSchemaVersion, SeverityId, clone_current_event};
 use opentelemetry::InstrumentationScope;
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _, Severity};
@@ -414,7 +414,17 @@ fn log_record(
         None => serde_json::to_string(event)?,
         Some(schema_version) => {
             let mut body = serde_json::to_value(event)?;
-            downgrade_event(&mut body, schema_version.as_str());
+            if let DowngradeOutcome::KeptNative { reason } =
+                downgrade_event(&mut body, schema_version.as_str())
+            {
+                record_kept_native(&reason);
+                metrics::counter!(
+                    "openshell_ocsf_otlp_kept_native_total",
+                    "class_uid" => base.class_uid.to_string(),
+                    "target" => schema_version.as_str()
+                )
+                .increment(1);
+            }
             serde_json::to_string(&body)?
         }
     };
@@ -505,8 +515,25 @@ mod tests {
     fn body_follows_the_configured_schema_version() {
         let event = event("sandbox-1", SeverityId::Informational);
         let body = body(&record(&event, Some(OcsfSchemaVersion::V1_3)));
-        assert_eq!(body["metadata"]["version"], "1.3");
+        assert_eq!(body["metadata"]["version"], "1.3.0");
         assert!(body.get("container").is_none());
+        // Attributes the target does not define are kept, not dropped.
+        assert!(body["unmapped"]["downgraded_attributes"]["container"].is_object());
+    }
+
+    #[test]
+    fn body_that_cannot_conform_stays_native_and_is_counted() {
+        // OCSF 1.1 requires an HTTP response; a request-only event cannot conform.
+        let event = openshell_ocsf::HttpActivityBuilder::new(&event_context("sandbox-1"))
+            .http_request(openshell_ocsf::HttpRequest::new(
+                "GET",
+                openshell_ocsf::Url::new("https", "api.example.com", "/", 443),
+            ))
+            .build();
+        let before = openshell_ocsf::format::downgrade::kept_native_tally().0;
+        let body = body(&record(&event, Some(OcsfSchemaVersion::V1_1)));
+        assert_eq!(body, native(&event));
+        assert!(openshell_ocsf::format::downgrade::kept_native_tally().0 > before);
     }
 
     #[test]

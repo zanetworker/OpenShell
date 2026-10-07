@@ -287,6 +287,7 @@ record its queue and writer:
 | `openshell_ocsf_log_queued_total` | Counter | None | Records queued for the file. |
 | `openshell_ocsf_log_written_total` | Counter | None | Records written to the file. |
 | `openshell_ocsf_log_dropped_total` | Counter | `reason` | Records discarded, by bounded reason. |
+| `openshell_ocsf_log_kept_native_total` | Counter | `class_uid`, `target` | Records written at the native OCSF version because they cannot conform to the configured `schema_version`. |
 | `openshell_ocsf_log_writer_errors_total` | Counter | None | Failed writes, reopens, and retention cleanups. |
 | `openshell_ocsf_log_recovery_discarded_bytes_total` | Counter | None | Bytes of an incomplete trailing line removed when the writer opens the file. |
 | `openshell_ocsf_log_queue_records` | Gauge | None | Records waiting to be written. |
@@ -304,6 +305,7 @@ enabled record its queue and exporter:
 | `openshell_ocsf_otlp_exported_total` | Counter | None | Records in batches the collector acknowledged, including records it rejected in a partial success. |
 | `openshell_ocsf_otlp_dropped_total` | Counter | `reason` | Records the gateway discarded: `queue_capacity`, `queue_bytes`, `oversized`, `export_failed`, `serialization`, or `closed`. |
 | `openshell_ocsf_otlp_export_errors_total` | Counter | None | Failed export attempts, including attempts that are retried. |
+| `openshell_ocsf_otlp_kept_native_total` | Counter | `class_uid`, `target` | Records exported at the native OCSF version because they cannot conform to the configured `schema_version`. |
 | `openshell_ocsf_otlp_retries_total` | Counter | None | Export attempts retried after a failure. |
 
 ## Next Steps

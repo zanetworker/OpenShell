@@ -679,7 +679,6 @@ mod tests {
             action: Some(ActionId::Allowed),
             disposition: None,
             observation_point_id: None,
-            is_src_dst_assignment_known: None,
         });
 
         let shorthand = event.format_shorthand();
@@ -709,7 +708,6 @@ mod tests {
             action: Some(ActionId::Allowed),
             disposition: Some(DispositionId::Allowed),
             observation_point_id: None,
-            is_src_dst_assignment_known: None,
         });
 
         let shorthand = event.format_shorthand();
@@ -740,7 +738,6 @@ mod tests {
             action: Some(ActionId::Allowed),
             disposition: Some(DispositionId::Allowed),
             observation_point_id: None,
-            is_src_dst_assignment_known: None,
         });
 
         let shorthand = event.format_shorthand();
@@ -767,7 +764,6 @@ mod tests {
             action: Some(ActionId::Denied),
             disposition: Some(DispositionId::Blocked),
             observation_point_id: None,
-            is_src_dst_assignment_known: None,
         });
 
         let denied_shorthand = denied_event.format_shorthand();
@@ -886,7 +882,6 @@ mod tests {
             action: Some(ActionId::Denied),
             disposition: Some(DispositionId::Blocked),
             observation_point_id: None,
-            is_src_dst_assignment_known: None,
         });
 
         let shorthand = event.format_shorthand();
@@ -1009,7 +1004,6 @@ mod tests {
             action: Some(ActionId::Allowed),
             disposition: None,
             observation_point_id: None,
-            is_src_dst_assignment_known: None,
         });
 
         let shorthand = event.format_shorthand();
